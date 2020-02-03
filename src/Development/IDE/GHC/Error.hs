@@ -25,6 +25,8 @@ module Development.IDE.GHC.Error
   ) where
 
 import                     Development.IDE.Types.Diagnostics as D
+import Data.Char (isSpace)
+import qualified           Data.List as L
 import qualified           Data.Text as T
 import Development.IDE.Types.Location
 import Development.IDE.GHC.Orphans()
@@ -36,10 +38,9 @@ import HscTypes
 import Panic
 import           ErrUtils
 import           SrcLoc
+import Text.Regex.TDFA as TDFA
 import qualified Outputable                 as Out
 import Exception (ExceptionMonad)
-
-
 
 diagFromText :: T.Text -> D.DiagnosticSeverity -> SrcSpan -> T.Text -> FileDiagnostic
 diagFromText diagSource sev loc msg = (toNormalizedFilePath' $ srcSpanToFilename loc,ShowDiag,)
@@ -56,10 +57,64 @@ diagFromText diagSource sev loc msg = (toNormalizedFilePath' $ srcSpanToFilename
 -- | Produce a GHC-style error from a source span and a message.
 diagFromErrMsg :: T.Text -> DynFlags -> ErrMsg -> [FileDiagnostic]
 diagFromErrMsg diagSource dflags e =
-    [ diagFromText diagSource sev (errMsgSpan e) $ T.pack $ Out.showSDoc dflags $
-      ErrUtils.formatErrDoc dflags $ ErrUtils.errMsgDoc e
+    [ diagFromText diagSource sev (errMsgSpan e) $ T.pack $ clean $ ("\n" <>) $ Out.showSDoc dflags $
+      ErrUtils.formatErrDoc dflags $ ErrUtils.errMsgDoc (strip e)
     | Just sev <- [toDSeverity $ errMsgSeverity e]]
+  where
+    strip :: ErrMsg -> ErrMsg
+    strip e =
+      e { errMsgDoc = (errMsgDoc e) { errDocContext = [] } }
 
+    clean :: String -> String
+    clean =
+      fromBlocks . filterBlocks False . toBlocks
+
+    filterBlocks :: Bool -> [[String]] -> [[String]]
+    filterBlocks _ [] = []
+    filterBlocks isHole ([] : xss) = filterBlocks isHole xss
+    filterBlocks isHole ((x : xs) : xss)
+      | "• Found hole" `L.isPrefixOf` x = (x : filterBlockRest xs) : filterBlocks True xss
+      | "• In the" `L.isPrefixOf` x = filterBlocks isHole xss
+      | "• In a" `L.isPrefixOf` x = filterBlocks isHole xss
+      | "• Relevant bindings" `L.isPrefixOf` x =
+        if isHole
+          then ("• Context:" : filterContext xs) : filterBlocks True xss
+          else filterBlocks False xss
+      | otherwise = (x : filterBlockRest xs) : filterBlocks isHole xss
+
+    filterBlockRest :: [String] -> [String]
+    filterBlockRest [] = []
+    filterBlockRest (x : xs)
+      | "In the" `L.isPrefixOf` dropWhile isSpace x = []
+      | "In a" `L.isPrefixOf` dropWhile isSpace x = []
+      | "Where" `L.isPrefixOf` dropWhile isSpace x = []
+      | otherwise = x : filterBlockRest xs
+
+    filterContext :: [String] -> [String]
+    filterContext =
+      concatMap filterLine
+
+    filterLine :: String -> [String]
+    filterLine x
+      | L.isPrefixOf "(bound at" $ dropWhile isSpace x = []
+      | Just (pre :: String, _ :: String, _ :: String, _ :: [String]) <- x =~~ (" \\(bound at" :: String) = [pre]
+      | L.isPrefixOf "(defined at " $ dropWhile isSpace x = []
+      | L.isPrefixOf "(Some bindings" $ dropWhile isSpace x = [takeWhile isSpace x ++ "[...]"]
+      | otherwise = [x]
+
+    toBlocks :: String -> [[String]]
+    toBlocks =
+      splits (L.isPrefixOf "• ") . lines
+
+    splits :: (a -> Bool) -> [a] -> [[a]]
+    splits _ [] = []
+    splits p (x : xs) =
+      case break p xs of
+        (ys, zs) -> (x : ys) : splits p zs
+
+    fromBlocks :: [[String]] -> String
+    fromBlocks =
+      unlines . concat
 
 diagFromErrMsgs :: T.Text -> DynFlags -> Bag ErrMsg -> [FileDiagnostic]
 diagFromErrMsgs diagSource dflags = concatMap (diagFromErrMsg diagSource dflags) . bagToList
